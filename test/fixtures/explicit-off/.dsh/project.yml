@@ -1,0 +1,3 @@
+# 假项目 B：随代码分发了开关文件，但显式否决项目内落点
+sessions: default
+sessionsRoot: .dsh/sessions

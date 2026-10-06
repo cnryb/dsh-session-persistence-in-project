@@ -1,0 +1,40 @@
+{
+  "name": "dsh-session-persistence-in-project",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Per-project session storage for DeepSeek Harness: keep the default root, unless a project opts in and gets its sessions inside the project",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./policy": "./src/policy.js",
+    "./router": "./src/router.js",
+    "./jsonl-layout": "./src/jsonl-layout.js",
+    "./roots": "./src/roots.js"
+  },
+  "files": [
+    "src"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cnryb/dsh-session-persistence-in-project.git"
+  },
+  "bugs": "https://github.com/cnryb/dsh-session-persistence-in-project/issues",
+  "homepage": "https://github.com/cnryb/dsh-session-persistence-in-project#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "harness:sandbox": "node tools/harness-sandbox.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-format": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-persistence": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.2.0-rc.2"
+  }
+}
