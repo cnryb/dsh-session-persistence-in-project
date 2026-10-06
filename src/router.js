@@ -120,8 +120,9 @@ export class ProjectScopedSessionPersistence extends SessionPersistence {
    * 用法上还有个后果：影子上下文挂在根 fiber 下，从它挂出去的子实例不归本插件所有，
    * 本插件被卸载时子实例不会跟着走、句柄不会被排空。用构造时的 ctx 两个问题一起解决。
    *
-   * 注意这里是**普通字段**而不是 `#private`：影子对象是 `Object.create(服务实例)`
-   * 出来的，私有字段不存在于影子对象上，读它会直接抛 TypeError。
+   * 注意这里是**普通字段**而不是 `#private`：方法被代理调用时 `this` 是服务实例的
+   * **影子 receiver** —— 以实例为原型（`instanceof` 仍为真），`ctx` 却被换成 cordis
+   * 的影子上下文 —— 私有字段因此读不到，会直接抛 TypeError。
    */
   spawnContext
 
@@ -367,14 +368,16 @@ export class ProjectScopedSessionPersistence extends SessionPersistence {
    * 同时持有同一个 id 的活写句柄 —— 每个子实例都监听 `session/event`，
    * 结果是同一段事件被静默写进两份日志。所以建之前先确认 id 没有落在别处。
    *
-   * 只有一个候选落点时直接跳过：那时后端自己的查重已经足够。
+   * 只有「写默认根、且还没有任何登记过的项目落点」时才跳过：那时候选落点只剩默认根
+   * 一个，后端自己的查重已经足够。反过来，**写项目落点时必须查** —— 哪怕登记表还是
+   * 空的（进程刚起、这是第一个项目会话），默认根也可能已经有这个 id。
    *
    * @param id - 会话 id。
    * @param targetRoot - 本次要写入的落点。
    */
   async assertNoCrossRootDuplicate(id, targetRoot) {
     if (typeof id !== 'string' || id === '') return
-    if (this.index.roots.length === 0) return
+    if (targetRoot === this.defaultRoot && this.index.roots.length === 0) return
     const found = await this.resolveById(id)
     if (found !== undefined && found.root !== targetRoot) throw new SessionAlreadyExistsError(id)
   }

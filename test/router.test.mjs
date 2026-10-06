@@ -17,12 +17,22 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
-import { projectKey } from '../src/jsonl-layout.js'
-import ProjectScopedSessionPersistence from '../src/router.js'
+import { projectKey } from '../src/path-encoding.js'
 import { HARNESS_HINT, loadHarness, makeHeader } from './helpers/harness.mjs'
 
 const harness = await loadHarness()
-const skip = harness.error === undefined ? false : HARNESS_HINT
+
+// 路由器本体 import 官方包，所以只能动态装载：缺依赖时整组跳过，
+// 而不是让整个文件停在 ERR_MODULE_NOT_FOUND 上。
+let ProjectScopedSessionPersistence
+let routerError
+try {
+  ;({ default: ProjectScopedSessionPersistence } = await import('../src/router.js'))
+} catch (error) {
+  routerError = error
+}
+
+const skip = harness.error === undefined && routerError === undefined ? false : HARNESS_HINT
 
 let sandbox
 let ctx
@@ -254,6 +264,32 @@ describe('路由器：一个 id 只能落一个地方', { skip }, () => {
     const snapshot = await service.stat('twice-1')
     assert.equal(snapshot?.header.cwd, plainProject)
     assert.equal(service.idRoots.get('twice-1'), defaultRoot)
+  })
+
+  it('登记表空着也要查重：默认根已有这个 id，第一个项目会话照样被挡', async () => {
+    // 全新路由器 + 全新登记表 = "进程刚起、这是第一个项目会话"的状态：
+    // 此时候选落点只有默认根，但查重不能因此跳过。
+    const ctx = new harness.cordis.Context()
+    const coldFork = ctx.plugin(ProjectScopedSessionPersistence, {
+      defaultRoot,
+      indexFile: join(sandbox, 'index', 'dedupe-cold.json'),
+    })
+    await coldFork
+    try {
+      const coldService = coldFork.ctx.sessionPersistence
+      const handle = await coldService.create(makeHeader('cold-dup-1', plainProject))
+      await handle.append([event(0)])
+      await handle.flush()
+      await handle.close()
+      assert.equal(coldService.index.roots.length, 0, '默认根永不登记，所以候选落点只剩它一个')
+
+      await assert.rejects(() => coldService.create(makeHeader('cold-dup-1', enabledProject)), (error) => {
+        assert.equal(error.name, 'SessionAlreadyExistsError')
+        return true
+      })
+    } finally {
+      await coldFork.dispose()
+    }
   })
 })
 

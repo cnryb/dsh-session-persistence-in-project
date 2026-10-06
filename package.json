@@ -11,6 +11,7 @@
     "./policy": "./src/policy.js",
     "./router": "./src/router.js",
     "./jsonl-layout": "./src/jsonl-layout.js",
+    "./path-encoding": "./src/path-encoding.js",
     "./roots": "./src/roots.js",
     "./flat-backend": "./vendor/dsh-session-persistence-jsonl-flat/index.js"
   },

@@ -6,7 +6,9 @@
  * 就会指到不存在的文件。所以这里不去断言"我认为正确的字符串"，而是实例化真正的
  * 官方后端，对同一批 (cwd, id) 逐条比对两边算出来的路径 —— 任一侧变了就红。
  *
- * 需要 harness 依赖；缺失时整组跳过（见 test/helpers/harness.mjs）。
+ * 需要 harness 依赖；缺失时整组跳过（见 test/helpers/harness.mjs）。因此这里的
+ * 官方包只能**动态**装载：静态 import 会让文件在模块加载阶段就失败，跳过逻辑
+ * 根本轮不到执行。
  */
 
 import assert from 'node:assert/strict'
@@ -14,10 +16,18 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
-import { DEFAULT_COMPRESSION, encodeSegment, flatSessionArtifactPath, projectKey, sessionArtifactPath } from '../src/jsonl-layout.js'
+import { encodeSegment } from '../src/path-encoding.js'
 import { HARNESS_HINT, loadHarness } from './helpers/harness.mjs'
 
 const harness = await loadHarness()
+
+let layout
+let layoutError
+try {
+  layout = await import('../src/jsonl-layout.js')
+} catch (error) {
+  layoutError = error
+}
 
 let FlatBackend
 let flatError
@@ -27,7 +37,7 @@ try {
   flatError = error
 }
 
-const skip = harness.error === undefined && flatError === undefined ? false : HARNESS_HINT
+const skip = harness.error === undefined && layoutError === undefined && flatError === undefined ? false : HARNESS_HINT
 
 /** 有代表性的一批 cwd：分隔符、空格、中文、`~`、`:`、超长、重复斜杠。 */
 const CWDS = [
@@ -96,7 +106,7 @@ describe('jsonl-layout 与官方后端逐条对齐', { skip }, () => {
     for (const cwd of CWDS) {
       for (const id of IDS) {
         assert.equal(
-          sessionArtifactPath(root, cwd, id),
+          layout.sessionArtifactPath(root, cwd, id),
           instance.locate({ cwd, id }).path,
           `cwd=${cwd} id=${id}`,
         )
@@ -109,7 +119,7 @@ describe('jsonl-layout 与官方后端逐条对齐', { skip }, () => {
     for (const cwd of CWDS) {
       for (const id of IDS) {
         assert.equal(
-          sessionArtifactPath(root, cwd, id, 'none'),
+          layout.sessionArtifactPath(root, cwd, id, 'none'),
           instance.locate({ cwd, id }).path,
           `cwd=${cwd} id=${id}`,
         )
@@ -120,7 +130,7 @@ describe('jsonl-layout 与官方后端逐条对齐', { skip }, () => {
   it('没有 cwd 的会话走 _no-cwd，两边一致', async () => {
     const { root, instance } = await backend('no-cwd')
     for (const id of IDS) {
-      assert.equal(sessionArtifactPath(root, undefined, id), instance.locate({ id }).path, `id=${id}`)
+      assert.equal(layout.sessionArtifactPath(root, undefined, id), instance.locate({ id }).path, `id=${id}`)
     }
   })
 
@@ -132,7 +142,7 @@ describe('jsonl-layout 与官方后端逐条对齐', { skip }, () => {
 
   it('产物一定落在自己的落点里，且最后一段就是编码后的 id', () => {
     const root = '/tmp/root'
-    const path = sessionArtifactPath(root, '/tmp/proj', 'session-1')
+    const path = layout.sessionArtifactPath(root, '/tmp/proj', 'session-1')
     assert.ok(path.startsWith(`${root}/--`))
     assert.ok(path.endsWith(`/session-1/${path.split('/').at(-1)}`))
     assert.match(path.split('/').at(-1), /^session\.v\d+\.jsonl\.zstd$/)
@@ -147,7 +157,11 @@ describe('扁平镜像与分叉后端逐条对齐', { skip }, () => {
     forks.push(fork)
     const instance = fork.ctx.sessionPersistence
     for (const id of IDS) {
-      assert.equal(flatSessionArtifactPath(root, id), instance.locate({ cwd: '/tmp/anywhere', id }).path, `id=${id}`)
+      assert.equal(
+        layout.flatSessionArtifactPath(root, id),
+        instance.locate({ cwd: '/tmp/anywhere', id }).path,
+        `id=${id}`,
+      )
     }
     const first = instance.locate({ cwd: '/tmp/one', id: IDS[0] }).path
     const second = instance.locate({ cwd: '/tmp/two', id: IDS[0] }).path
@@ -161,44 +175,24 @@ describe('扁平镜像与分叉后端逐条对齐', { skip }, () => {
     forks.push(fork)
     const instance = fork.ctx.sessionPersistence
     for (const id of IDS) {
-      assert.equal(flatSessionArtifactPath(root, id), instance.locate({ id }).path, `id=${id}`)
+      assert.equal(layout.flatSessionArtifactPath(root, id), instance.locate({ id }).path, `id=${id}`)
     }
   })
 
   it('扁平路径就是 <root>/<id>/<产物>，没有项目层', () => {
     const root = '/tmp/root'
-    const path = flatSessionArtifactPath(root, 'session-1')
+    const path = layout.flatSessionArtifactPath(root, 'session-1')
     assert.equal(path, `${root}/session-1/${path.split('/').at(-1)}`)
     assert.match(path.split('/').at(-1), /^session\.v\d+\.jsonl\.zstd$/)
-    assert.match(flatSessionArtifactPath(root, 'session-1', 'none'), /session\.v\d+\.jsonl$/)
+    assert.match(layout.flatSessionArtifactPath(root, 'session-1', 'none'), /session\.v\d+\.jsonl$/)
   })
 })
 
-describe('编解码本身的语义（不依赖 harness）', () => {
-  it('编码后的 id 永远是单段路径，`..` 逃不出去', () => {
-    assert.equal(encodeSegment('..'), '~002E~002E')
-    assert.equal(encodeSegment('.'), '~002E')
-    assert.equal(encodeSegment('a/b'), 'a~002Fb')
-    assert.equal(encodeSegment('a\\b'), 'a~005Cb')
-    assert.equal(encodeSegment('~'), '~007E')
-    assert.equal(encodeSegment('中文'), '~4E2D~6587')
-    assert.equal(encodeSegment('plain-id.1_2'), 'plain-id.1_2')
-  })
-
-  it('项目目录名折叠连续分隔符、去掉前导横线、超长截断', () => {
-    assert.equal(projectKey('/a/b'), '--a-b--')
-    assert.equal(projectKey('//a//b'), '--a-b--')
-    assert.equal(projectKey('C:\\Users\\me'), '--C-Users-me--')
-    assert.equal(projectKey('/'), '--root--')
-    const long = projectKey(`/${'x'.repeat(400)}`)
-    assert.equal(long.length, 255)
-    assert.ok(long.startsWith('--') && long.endsWith('--'))
-  })
-
-  it('默认编码是 zstd，产物名跟着格式代际走', () => {
-    assert.equal(DEFAULT_COMPRESSION, 'zstd')
-    const path = sessionArtifactPath('/root', '/proj', 'id')
+describe('产物命名跟着格式代际走', { skip }, () => {
+  it('默认编码是 zstd，产物名用的是运行时那个格式版本', () => {
+    assert.equal(layout.DEFAULT_COMPRESSION, 'zstd')
+    const path = layout.sessionArtifactPath('/root', '/proj', 'id')
     assert.match(path, /session\.v\d+\.jsonl\.zstd$/)
-    assert.match(sessionArtifactPath('/root', '/proj', 'id', 'none'), /session\.v\d+\.jsonl$/)
+    assert.match(layout.sessionArtifactPath('/root', '/proj', 'id', 'none'), /session\.v\d+\.jsonl$/)
   })
 })

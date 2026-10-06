@@ -19,7 +19,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
-import { projectKey } from '../src/jsonl-layout.js'
+import { projectKey } from '../src/path-encoding.js'
 import { HARNESS_HINT, loadHarness, makeHeader } from './helpers/harness.mjs'
 
 const harness = await loadHarness()

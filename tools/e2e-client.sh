@@ -116,7 +116,8 @@ if [ "$STATUS" != "200" ]; then
 fi
 grep -q 'window.__ModuleLoader__.load' "$WORK/served.js" || { echo "FAIL 取到的不是模块 bundle" >&2; exit 1; }
 grep -q 'plugins\.item' "$WORK/served.js" || { echo "FAIL bundle 里没有 plugins.item 槽注册" >&2; exit 1; }
-grep -q "$PKG" "$WORK/served.js" || { echo "FAIL bundle 的 id 不是包名" >&2; exit 1; }
+# 只认注册对象里的 id 字段：包名在 factory 体的注释里也会出现，宽泛匹配等于没查。
+grep -Eq "id:[[:space:]]*\"$PKG\"" "$WORK/served.js" || { echo "FAIL 注册的 id 不是包名" >&2; exit 1; }
 echo "OK  /plugins 取到 bundle（$(wc -c < "$WORK/served.js" | tr -d ' ') 字节），槽注册与 id 都对"
 
 echo
