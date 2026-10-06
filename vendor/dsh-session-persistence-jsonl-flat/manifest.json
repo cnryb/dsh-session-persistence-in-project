@@ -1,0 +1,26 @@
+{
+  "note": "这是派生产物：由 tools/vendor-jsonl-flat.mjs 生成。改动请改补丁表，不要改这里的文件。",
+  "upstream": {
+    "name": "@deepseek-ai/dsh-session-persistence-jsonl",
+    "version": "0.2.0-rc.2"
+  },
+  "sourceSha256": "0845707017acc2b4a8a75eab2244fa3fd88587b8094ab32014321dce7ca1e31b",
+  "patches": [
+    "project-dir-flat",
+    "legacy-dirs-field",
+    "flat-project-dirs-and-legacy-scan",
+    "find-log-legacy-fallback",
+    "list-generations-legacy-merge",
+    "stored-identity-accepts-legacy",
+    "legacy-layout-path-helper",
+    "path-for-write-paths",
+    "path-for-repair",
+    "path-for-locate",
+    "reject-opposite-covers-legacy"
+  ],
+  "outputs": {
+    "index.js": "73f1b6f18a5d69d1b9baabe7a77e44513398e9447738c5a188aa9030c07dbb95",
+    "worker.cjs": "cadd901598e2bb8a847409a980f59deea639eeadf21e30da324fb674a4ed8038",
+    "LICENSE": "ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be"
+  }
+}

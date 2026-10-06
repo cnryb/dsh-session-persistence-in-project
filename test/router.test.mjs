@@ -31,6 +31,7 @@ let service
 let defaultRoot
 let indexFile
 let enabledProject
+let layeredProject
 let plainProject
 
 /**
@@ -50,9 +51,12 @@ before(async () => {
   indexFile = join(sandbox, 'index', 'roots.json')
   plainProject = join(sandbox, 'projects', 'plain')
   enabledProject = join(sandbox, 'projects', 'enabled')
+  layeredProject = join(sandbox, 'projects', 'layered')
   mkdirSync(plainProject, { recursive: true })
   mkdirSync(join(enabledProject, '.dsh'), { recursive: true })
+  mkdirSync(join(layeredProject, '.dsh'), { recursive: true })
   writeFileSync(join(enabledProject, '.dsh', 'project.yml'), '# 文件存在即开启\nsessions: project\n')
+  writeFileSync(join(layeredProject, '.dsh', 'project.yml'), 'sessions: project\n')
 
   ctx = new harness.cordis.Context()
   fork = ctx.plugin(ProjectScopedSessionPersistence, { defaultRoot, indexFile, maxIndexedRoots: 20 })
@@ -109,9 +113,39 @@ describe('路由器：按项目分流', { skip }, () => {
     const path = await seed('enabled-1', enabledProject)
     assert.ok(path.startsWith(`${join(enabledProject, '.dsh', 'sessions')}/`), path)
     assert.ok(existsSync(path), `产物不存在：${path}`)
-    // 多出来的 --<规范化 cwd>-- 那一层是官方后端加的，不是本插件加的
-    assert.ok(path.includes(`/${projectKey(enabledProject)}/`), path)
     assert.equal(service.decide(enabledProject).reason, 'switch-says-project')
+  })
+
+  it('项目内落点默认扁平：<root>/<id>/，官方那层 --<cwd>-- 不再出现', async () => {
+    const path = await seed('enabled-flat', enabledProject)
+    const root = join(enabledProject, '.dsh', 'sessions')
+    assert.equal(path, join(root, 'enabled-flat', 'session.v4.jsonl.zstd'))
+    assert.equal(existsSync(join(root, projectKey(enabledProject))), false, '不该出现官方那层项目目录')
+  })
+
+  it("layout: 'layered' 时退回官方后端：全新项目仍然是官方那层项目目录", async () => {
+    // 必须用一个**没写过扁平会话**的项目：官方后端看见扁平会话目录会直接报错
+    // （见「两种布局的方向是单向的」一组），所以 layered 是「一开始就选它」，
+    // 不是「事后退回去」。
+    const layered = new harness.cordis.Context()
+    const layeredFork = layered.plugin(ProjectScopedSessionPersistence, {
+      defaultRoot,
+      indexFile: join(sandbox, 'index', 'layered.json'),
+      layout: 'layered',
+    })
+    await layeredFork
+    try {
+      const layeredService = layeredFork.ctx.sessionPersistence
+      const handle = await layeredService.create(makeHeader('layered-1', layeredProject))
+      await handle.append([event(0)])
+      await handle.flush()
+      const path = layeredService.locate(handle.header).path
+      await handle.close()
+      assert.equal(path, join(layeredProject, '.dsh', 'sessions', projectKey(layeredProject), 'layered-1', 'session.v4.jsonl.zstd'))
+      assert.ok(existsSync(path), path)
+    } finally {
+      await layeredFork.dispose()
+    }
   })
 
   it('落点判定被缓存：同一次进程内不再重复读盘', () => {
@@ -232,6 +266,131 @@ describe('路由器：flush 扇出', { skip }, () => {
     await handle.close()
     const snapshot = await service.stat('flush-1')
     assert.ok(snapshot.sizeBytes > 0, '服务级 flush 之后产物应该已经落盘')
+  })
+})
+
+describe('路由器：两种布局的方向是单向的', { skip }, () => {
+  it('layered 撞上已有的扁平数据：官方后端明确报错，而不是静默看不见', async () => {
+    // enabledProject 的落点里已经有扁平会话（前面用例建的），这正是 layered 的禁区
+    const ctx = new harness.cordis.Context()
+    const fork = ctx.plugin(ProjectScopedSessionPersistence, {
+      defaultRoot,
+      indexFile: join(sandbox, 'index', 'layered-mixed.json'),
+      layout: 'layered',
+    })
+    await fork
+    try {
+      await assert.rejects(
+        () => fork.ctx.sessionPersistence.create(makeHeader('layered-mixed-1', enabledProject)),
+        /unsupported flat-file layout/,
+      )
+    } finally {
+      await fork.dispose()
+    }
+  })
+
+  it('反过来没问题：flat 路由器读 layered 写下的会话', async () => {
+    // layeredProject 的落点已经登记在那个 index 文件里，flat 路由器按登记表去探测
+    const ctx = new harness.cordis.Context()
+    const fork = ctx.plugin(ProjectScopedSessionPersistence, {
+      defaultRoot,
+      indexFile: join(sandbox, 'index', 'layered.json'),
+    })
+    await fork
+    try {
+      const service = fork.ctx.sessionPersistence
+      const snapshot = await service.stat('layered-1')
+      assert.equal(snapshot?.header.cwd, layeredProject)
+      const handle = await service.open('layered-1', 'read')
+      const { events } = await handle.read()
+      assert.equal(events.length, 1)
+      await handle.close()
+      // 镜像兜底也要指到旧路径上（子实例还没建时也算得对）
+      const cold = new harness.cordis.Context()
+      const coldFork = cold.plugin(ProjectScopedSessionPersistence, {
+        defaultRoot,
+        indexFile: join(sandbox, 'index', 'layered.json'),
+      })
+      await coldFork
+      try {
+        const path = coldFork.ctx.sessionPersistence.locate(makeHeader('layered-1', layeredProject)).path
+        assert.equal(path, service.locate(handle.header).path)
+        assert.ok(existsSync(path), path)
+      } finally {
+        await coldFork.dispose()
+      }
+    } finally {
+      await fork.dispose()
+    }
+  })
+})
+
+describe('路由器：设置页要的那份 Config', { skip }, () => {
+  /**
+   * 复刻 `@deepseek-ai/dsh-settings` 的 `volatileForm()` 判据：整棵 schema 里
+   * 只有「最近的 volatile 祖先」标记过的字段会进表单。
+   *
+   * @param schema - schemastery schema。
+   * @returns 可编辑字段的路径集合。
+   */
+  function volatilePaths(schema) {
+    const paths = []
+    const walk = (node, path) => {
+      if (node?.meta?.volatile === true) {
+        paths.push(path.join('.'))
+        return
+      }
+      for (const [key, child] of Object.entries(node?.dict ?? {})) walk(child, [...path, key])
+    }
+    walk(schema, [])
+    return paths.sort()
+  }
+
+  it('只有标了 volatile 的字段可编辑，defaultRoot 不在其中', () => {
+    assert.deepEqual(volatilePaths(ProjectScopedSessionPersistence.Config), ['indexFile', 'layout', 'maxIndexedRoots'])
+  })
+
+  it('三个 volatile 字段都有默认值或可清空语义，页面不会一打开就是脏的', () => {
+    // schemastery 自己就把 volatile 字段包成了 { get() } 引用（loader 再原地更新它）
+    const resolved = ProjectScopedSessionPersistence.Config({})
+    assert.equal(resolved.layout.get(), 'flat')
+    assert.equal(resolved.maxIndexedRoots.get(), 100)
+    assert.equal(resolved.indexFile.get(), undefined)
+    assert.equal(typeof resolved.defaultRoot, 'string', 'defaultRoot 是普通字段，不参与热更新')
+  })
+
+  it('volatile 字段被原地更新后，新判定立刻生效（模拟 loader 的热更新）', async () => {
+    const volatileProject = join(sandbox, 'projects', 'volatile')
+    mkdirSync(join(volatileProject, '.dsh'), { recursive: true })
+    writeFileSync(join(volatileProject, '.dsh', 'project.yml'), 'sessions: project\n')
+
+    const ctx = new harness.cordis.Context()
+    const fork = ctx.plugin(ProjectScopedSessionPersistence, {
+      defaultRoot,
+      indexFile: join(sandbox, 'index', 'volatile.json'),
+      maxIndexedRoots: 20,
+    })
+    await fork
+    try {
+      const service = fork.ctx.sessionPersistence
+      assert.equal(service.layout, 'flat')
+
+      // loader 把 volatile 字段换成引用对象后再发事件；这里就按那个形状模拟
+      service.config.layout = { get: () => 'layered' }
+      fork.ctx.emit('loader/volatile-update', [['layout']])
+
+      assert.equal(service.layout, 'layered')
+      assert.equal(service.children.size, 0, '换了布局要丢掉旧子实例')
+
+      const handle = await service.create(makeHeader('volatile-1', volatileProject))
+      await handle.append([event(0)])
+      await handle.flush()
+      const path = service.locate(handle.header).path
+      await handle.close()
+      assert.ok(path.includes(`/${projectKey(volatileProject)}/`), path)
+    } finally {
+      await fork.dispose()
+    }
   })
 })
 

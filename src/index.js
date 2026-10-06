@@ -26,8 +26,11 @@ export {
 } from './policy.js'
 export {
   DEFAULT_COMPRESSION,
+  LAYOUT_FLAT,
+  LAYOUT_LAYERED,
   NO_CWD_DIR,
   encodeSegment,
+  flatSessionArtifactPath,
   projectKey,
   sessionArtifactPath,
 } from './jsonl-layout.js'

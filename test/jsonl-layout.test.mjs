@@ -14,11 +14,20 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
-import { DEFAULT_COMPRESSION, encodeSegment, projectKey, sessionArtifactPath } from '../src/jsonl-layout.js'
+import { DEFAULT_COMPRESSION, encodeSegment, flatSessionArtifactPath, projectKey, sessionArtifactPath } from '../src/jsonl-layout.js'
 import { HARNESS_HINT, loadHarness } from './helpers/harness.mjs'
 
 const harness = await loadHarness()
-const skip = harness.error === undefined ? false : HARNESS_HINT
+
+let FlatBackend
+let flatError
+try {
+  ;({ default: FlatBackend } = await import('../vendor/dsh-session-persistence-jsonl-flat/index.js'))
+} catch (error) {
+  flatError = error
+}
+
+const skip = harness.error === undefined && flatError === undefined ? false : HARNESS_HINT
 
 /** 有代表性的一批 cwd：分隔符、空格、中文、`~`、`:`、超长、重复斜杠。 */
 const CWDS = [
@@ -127,6 +136,41 @@ describe('jsonl-layout 与官方后端逐条对齐', { skip }, () => {
     assert.ok(path.startsWith(`${root}/--`))
     assert.ok(path.endsWith(`/session-1/${path.split('/').at(-1)}`))
     assert.match(path.split('/').at(-1), /^session\.v\d+\.jsonl\.zstd$/)
+  })
+})
+
+describe('扁平镜像与分叉后端逐条对齐', { skip }, () => {
+  it('每个 id 都与分叉 locate() 一致，且 cwd 不再参与路径', async () => {
+    const root = join(sandbox, 'flat')
+    const fork = ctx.isolate('sessionPersistence').plugin(FlatBackend, { root })
+    await fork
+    forks.push(fork)
+    const instance = fork.ctx.sessionPersistence
+    for (const id of IDS) {
+      assert.equal(flatSessionArtifactPath(root, id), instance.locate({ cwd: '/tmp/anywhere', id }).path, `id=${id}`)
+    }
+    const first = instance.locate({ cwd: '/tmp/one', id: IDS[0] }).path
+    const second = instance.locate({ cwd: '/tmp/two', id: IDS[0] }).path
+    assert.equal(first, second, '扁平布局下 cwd 不该影响路径')
+  })
+
+  it('没有 cwd 的会话在扁平布局里也是同一条路径', async () => {
+    const root = join(sandbox, 'flat-no-cwd')
+    const fork = ctx.isolate('sessionPersistence').plugin(FlatBackend, { root })
+    await fork
+    forks.push(fork)
+    const instance = fork.ctx.sessionPersistence
+    for (const id of IDS) {
+      assert.equal(flatSessionArtifactPath(root, id), instance.locate({ id }).path, `id=${id}`)
+    }
+  })
+
+  it('扁平路径就是 <root>/<id>/<产物>，没有项目层', () => {
+    const root = '/tmp/root'
+    const path = flatSessionArtifactPath(root, 'session-1')
+    assert.equal(path, `${root}/session-1/${path.split('/').at(-1)}`)
+    assert.match(path.split('/').at(-1), /^session\.v\d+\.jsonl\.zstd$/)
+    assert.match(flatSessionArtifactPath(root, 'session-1', 'none'), /session\.v\d+\.jsonl$/)
   })
 })
 

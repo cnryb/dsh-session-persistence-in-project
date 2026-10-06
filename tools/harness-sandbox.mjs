@@ -40,6 +40,12 @@ export const ROOT_PACKAGES = [
   '@deepseek-ai/dsh-session-format',
   '@deepseek-ai/dsh-session-persistence',
   '@deepseek-ai/dsh-session-persistence-jsonl',
+  // 扁平分叉（vendor/）与官方后端 import 的是同一批包，但它的 import 是**从本插件
+  // 出发**解析的，所以必须在 package.json 里逐个声明成 peer，并在这里进入闭包。
+  '@deepseek-ai/dsh-session-format-catalog',
+  '@deepseek-ai/dsh-session-format-v3-to-v4',
+  '@deepseek-ai/dsh-llm',
+  '@deepseek-ai/node-addon-system',
 ]
 
 /** asar 里的包根目录前缀。 */

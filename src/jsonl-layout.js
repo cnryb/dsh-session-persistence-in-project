@@ -21,6 +21,10 @@ import { join } from 'node:path'
 export const DEFAULT_COMPRESSION = 'zstd'
 /** header 里没有 cwd 时，官方使用的项目目录名。 */
 export const NO_CWD_DIR = '_no-cwd'
+/** 落点布局：官方布局，`root/<项目目录>/<id>/`。 */
+export const LAYOUT_LAYERED = 'layered'
+/** 落点布局：扁平布局（分叉后端），`root/<id>/`。 */
+export const LAYOUT_FLAT = 'flat'
 
 /**
  * 把任意字符串编码成一个安全路径段（官方的 `encodeSegment`）。
@@ -89,4 +93,25 @@ export function sessionArtifactPath(root, cwd, id, compression = DEFAULT_COMPRES
   const project = cwd === undefined || cwd === null ? NO_CWD_DIR : projectKey(cwd)
   const suffix = compression === 'zstd' ? '.zstd' : ''
   return join(root, project, encodeSegment(id), `${sessionFormatLogFilename(SESSION_FORMAT_VERSION)}${suffix}`)
+}
+
+/**
+ * 扁平布局的产物路径：`root/<id>/session.v<版本>.jsonl[.zstd]`。
+ *
+ * 官方后端没有这个布局（`projectDir()` 硬编码了项目层），它由
+ * `vendor/dsh-session-persistence-jsonl-flat` 提供 —— 只在**项目内落点**上用：
+ * 那里只有一个项目，再套一层 `--<cwd>--` 纯属重复。默认根不能用它：那是多个项目
+ * 共用的容器，项目层是必需的。
+ *
+ * 与 {@link sessionArtifactPath} 一样，这是给同步的 `locate()` 兜底用的镜像；
+ * 差分测试（`test/jsonl-layout.test.mjs`）会把它和分叉后端的 `locate()` 钉在一起。
+ *
+ * @param root - 项目内落点根目录。
+ * @param id - 会话 id。
+ * @param compression - 产物编码，`zstd` 或 `none`。
+ * @returns 绝对产物路径。
+ */
+export function flatSessionArtifactPath(root, id, compression = DEFAULT_COMPRESSION) {
+  const suffix = compression === 'zstd' ? '.zstd' : ''
+  return join(root, encodeSegment(id), `${sessionFormatLogFilename(SESSION_FORMAT_VERSION)}${suffix}`)
 }

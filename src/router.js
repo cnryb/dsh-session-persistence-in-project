@@ -34,6 +34,17 @@
  * 只需要回答「这个 id 可能在哪些 root 里」—— 默认根 + 登记过的项目落点
  * （见 `./roots.js`），逐个 `stat(id)` 探测即可，命中即返回。
  *
+ * ## 两种落点布局
+ *
+ * - **默认根**用官方后端（`LAYOUT_LAYERED`）：它服务多个项目，`--<cwd>--` 那一层
+ *   是必需的。
+ * - **项目内落点**默认用扁平分叉（`LAYOUT_FLAT`，见 `vendor/`）：那里只有一个
+ *   项目，项目层纯属重复，所以新会话直接落 `<root>/<id>/`。分叉同时保证升级前
+ *   写在 `<root>/--<cwd>--/<id>/` 的老会话**原地可读可续写**，不自动搬迁数据。
+ *
+ * 想退回官方布局（比如分叉在某个新 DSH 上出了问题），把 Config 的 `layout` 设成
+ * `layered` 即可 —— 那是官方后端，行为与本插件第一版完全一致。
+ *
  * @module dsh-session-persistence-in-project/router
  */
 
@@ -44,9 +55,16 @@ import {
   SessionPersistenceNotFoundError,
 } from '@deepseek-ai/dsh-session-persistence'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { sessionArtifactPath } from './jsonl-layout.js'
+import FlatJsonlSessionPersistence from '../vendor/dsh-session-persistence-jsonl-flat/index.js'
+import {
+  DEFAULT_COMPRESSION,
+  LAYOUT_FLAT,
+  LAYOUT_LAYERED,
+  flatSessionArtifactPath,
+  sessionArtifactPath,
+} from './jsonl-layout.js'
 import { FALLBACK_DEFAULT_ROOT, LOCATION_DEFAULT, LOCATION_PROJECT, resolveLocation } from './policy.js'
 import { RootIndex, defaultIndexFile } from './roots.js'
 
@@ -55,12 +73,27 @@ import { RootIndex, defaultIndexFile } from './roots.js'
  */
 export class ProjectScopedSessionPersistence extends SessionPersistence {
   static Config = z.object({
-    /** 未开启开关的项目共用的默认根，应与 DSH 自身的默认一致。 */
+    /**
+     * 未开启开关的项目共用的默认根，应与 DSH 自身的默认一致
+     * （装配层通常写 `!!js dshHomePath('sessions')`）。
+     *
+     * **刻意不是 volatile**：改成字面值就不再跟随 `DSH_HOME`，而这个字段在一次
+     * 部署里几乎不需要改。保持普通字段，设置页也就写不动它。
+     */
     defaultRoot: z.string().default(FALLBACK_DEFAULT_ROOT),
     /** 落点登记表路径；默认 `<DSH_HOME>/session-persistence-in-project/roots.json`。 */
-    indexFile: z.string(),
+    indexFile: z.string().volatile(),
     /** 登记表最多记多少个项目落点，超出时淘汰最久未用的。 */
-    maxIndexedRoots: z.number().default(100),
+    maxIndexedRoots: z.number().default(100).volatile(),
+    /**
+     * 项目内落点用哪种布局：`flat`（默认，`<root>/<id>/`，分叉后端）或
+     * `layered`（官方后端，`<root>/--<cwd>--/<id>/`）。默认根永远是 `layered`。
+     *
+     * **方向是单向的**：分叉能读能续写旧的 `layered` 数据（升级平滑），但官方后端
+     * 看见扁平会话目录会直接判成非法的 flat-file 布局并拒绝服务。所以 `layered`
+     * 只能给还没写过扁平会话的项目用，不是「随时退回去」的开关。
+     */
+    layout: z.union([z.const(LAYOUT_FLAT), z.const(LAYOUT_LAYERED)]).default(LAYOUT_FLAT).volatile(),
   })
 
   /** 诊断用的后端标签；覆盖 `Service.name`，但不改服务键。 */
@@ -100,14 +133,77 @@ export class ProjectScopedSessionPersistence extends SessionPersistence {
     super(ctx)
     this.spawnContext = ctx
     this.config = config
-    this.defaultRoot = resolve(config.defaultRoot)
-    this.index = new RootIndex({
-      defaultRoot: this.defaultRoot,
-      indexFile: resolve(config.indexFile ?? defaultIndexFile()),
-      maxRoots: config.maxIndexedRoots,
-      onError: (error) => this.warn(`落点登记表不可用（${this.index?.indexFile ?? '?'}）：${error.message}`),
+    this.applyConfig()
+    // 自带配置页：告诉 settings 服务别再按 schema 自动生成本插件的页面。
+    // 服务不在（比如无 UI 的部署）就什么也不做 —— 业务不依赖它。
+    ctx.inject(['settings'], (child) => {
+      child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
     })
-    this.index.load()
+    // volatile 字段由 loader 原地更新，然后在这个事件里通知我们（不会重挂插件）。
+    ctx.on('loader/volatile-update', () => {
+      try {
+        this.applyConfig()
+      } catch (error) {
+        this.warn(`配置热更新失败，继续用上一份配置：${error.message}`)
+      }
+    })
+  }
+
+  /**
+   * 把当前配置读进来；变了就重建受影响的那部分状态。
+   *
+   * volatile 字段在 loader 里是**引用对象**（`{ get() }`），普通字段还是值本身，
+   * 两种都得认；测试里直接传普通对象，所以这里不能假设一定是引用。
+   *
+   * 变化的影响面：`defaultRoot` / `layout` 变了要丢掉所有子实例与缓存（它们的落点
+   * 或布局已经不是同一个了），`indexFile` / `maxIndexedRoots` 变了只重建登记表。
+   * 改落点是部署动作，正在写的句柄该由调用方自己收尾 —— 这里只保证**新的**调用走新配置。
+   */
+  applyConfig() {
+    const nextDefaultRoot = resolve(readConfigValue(this.config?.defaultRoot, FALLBACK_DEFAULT_ROOT))
+    const nextLayout = readConfigValue(this.config?.layout, LAYOUT_FLAT)
+    const nextIndexFile = resolve(readConfigValue(this.config?.indexFile, undefined) ?? defaultIndexFile())
+    const nextMaxRoots = readConfigValue(this.config?.maxIndexedRoots, 100)
+
+    const rootsChanged = nextDefaultRoot !== this.defaultRoot || nextLayout !== this.layout
+    if (rootsChanged) this.discardChildren()
+
+    this.defaultRoot = nextDefaultRoot
+    this.layout = nextLayout
+
+    if (
+      this.index === undefined ||
+      this.index.defaultRoot !== nextDefaultRoot ||
+      this.index.indexFile !== nextIndexFile ||
+      this.index.maxRoots !== nextMaxRoots
+    ) {
+      this.index = new RootIndex({
+        defaultRoot: nextDefaultRoot,
+        indexFile: nextIndexFile,
+        maxRoots: nextMaxRoots,
+        onError: (error) => this.warn(`落点登记表不可用（${this.index?.indexFile ?? '?'}）：${error.message}`),
+      })
+      this.index.load()
+    }
+  }
+
+  /**
+   * 丢掉所有子实例与按落点缓存的判定，让下一次调用按新配置重建。
+   *
+   * 子实例的卸载是异步的（`ctx.plugin()` 返回 thenable）：即使还在激活中，也等它
+   * 就绪之后再 dispose —— 直接扔掉的话，那个 fiber 会一直挂在进程里。
+   */
+  discardChildren() {
+    const entries = [...this.children.values()]
+    this.children.clear()
+    this.decisions.clear()
+    this.idRoots.clear()
+    for (const entry of entries) {
+      const pending = entry.promise ?? Promise.resolve(entry.fork)
+      Promise.resolve(pending)
+        .then(() => entry.fork?.dispose?.())
+        .catch(() => {})
+    }
   }
 
   /**
@@ -135,6 +231,22 @@ export class ProjectScopedSessionPersistence extends SessionPersistence {
   }
 
   /**
+   * 某个落点该用哪个后端类。
+   *
+   * 默认根永远用官方后端：它是多项目共用的容器，项目层是必需的。项目内落点按
+   * `layout` 选 —— 默认是扁平分叉，`layered` 则退回官方后端。
+   *
+   * 判定只看 root 字符串，同步可得，所以 `locate()` 也能算出同一条路径。
+   *
+   * @param root - 绝对落点。
+   * @returns 后端插件类。
+   */
+  backendClassFor(root) {
+    if (root === this.defaultRoot) return JsonlSessionPersistence
+    return this.layout === LAYOUT_LAYERED ? JsonlSessionPersistence : FlatJsonlSessionPersistence
+  }
+
+  /**
    * 取（或懒建）某个落点上的官方 JSONL 后端子实例。
    *
    * 同一落点只建一次：并发调用共享同一个 promise。构造失败时把条目清掉，
@@ -149,8 +261,10 @@ export class ProjectScopedSessionPersistence extends SessionPersistence {
       entry = { backend: null, promise: null }
       this.children.set(root, entry)
       entry.promise = (async () => {
+        this.warnIfLayeredRootHasFlatData(root)
+        const Backend = this.backendClassFor(root)
         const scope = this.spawnContext.isolate('sessionPersistence')
-        const fork = scope.plugin(JsonlSessionPersistence, { root })
+        const fork = scope.plugin(Backend, { root })
         await fork
         entry.fork = fork
         entry.backend = fork.ctx.sessionPersistence
@@ -343,6 +457,10 @@ export class ProjectScopedSessionPersistence extends SessionPersistence {
    * 子实例已经建好就转交给它（拿到的就是官方原样的答案），否则用
    * `./jsonl-layout.js` 的镜像算一条等价路径 —— 那份镜像由差分测试钉住。
    *
+   * 扁平布局下多一步：镜像先按扁平位置算，文件不在时再看一眼升级前的分层目录
+   * （`<root>/<旧项目目录>/<id>/`）。`locate` 只在诊断路径上被调用，这点 readdir
+   * 的代价无关紧要，换来的是报错信息里的路径真的存在。
+   *
    * @param meta - 存储的 header。
    * @returns 产物类型与绝对路径。
    */
@@ -350,7 +468,69 @@ export class ProjectScopedSessionPersistence extends SessionPersistence {
     const decision = this.decide(meta?.cwd)
     const entry = this.children.get(decision.root)
     if (entry?.backend) return entry.backend.locate(meta)
-    return { kind: 'jsonl', path: sessionArtifactPath(decision.root, meta?.cwd, meta?.id) }
+    return { kind: 'jsonl', path: this.mirroredArtifactPath(decision, meta) }
+  }
+
+  /**
+   * 镜像兜底路径：算不碰磁盘的那条等价路径。
+   *
+   * @param decision - {@link decide} 的结果。
+   * @param meta - 存储的 header。
+   * @returns 绝对产物路径。
+   */
+  mirroredArtifactPath(decision, meta) {
+    if (this.backendClassFor(decision.root) === JsonlSessionPersistence) {
+      return sessionArtifactPath(decision.root, meta?.cwd, meta?.id, DEFAULT_COMPRESSION)
+    }
+    const flat = flatSessionArtifactPath(decision.root, meta?.id, DEFAULT_COMPRESSION)
+    if (existsSync(flat)) return flat
+    return this.findLegacyArtifactPath(decision.root, meta?.id) ?? flat
+  }
+
+  /**
+   * 在升级前的分层目录里找一个会话的产物。
+   *
+   * 结构是 `<root>/<旧项目目录>/<id>/session.v<版本>.jsonl[.zstd]`：只看一层子目录，
+   * 不重算 `projectKey`（那是官方私有的有损编码，而且项目改过路径就失灵）。
+   *
+   * @param root - 项目内落点。
+   * @param id - 会话 id。
+   * @returns 绝对路径；找不到时 `undefined`。
+   */
+  findLegacyArtifactPath(root, id) {
+    if (typeof id !== 'string' || id === '') return undefined
+    let entries
+    try {
+      entries = readdirSync(root, { withFileTypes: true })
+    } catch {
+      return undefined
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const candidate = flatSessionArtifactPath(resolve(root, entry.name), id, DEFAULT_COMPRESSION)
+      if (existsSync(candidate)) return candidate
+    }
+    return undefined
+  }
+
+  /**
+   * `layered` 布局下的防火告警。
+   *
+   * 官方后端把 root 下的每个子目录都当项目目录，进而在「会话目录」里看到
+   * `session.v*.jsonl[.zstd]` 文件，直接判成非法的 flat-file 布局并抛错
+   * （错误信息还建议「换个 root 或挪进项目/会话目录」，与本插件的实际情形对不上）。
+   * 提前记一笔，省得用户对着一句莫名其妙的报错排查。
+   *
+   * @param root - 绝对落点。
+   */
+  warnIfLayeredRootHasFlatData(root) {
+    if (this.layout !== LAYOUT_LAYERED || root === this.defaultRoot) return
+    const flat = findFlatSessionDir(root)
+    if (flat === undefined) return
+    this.warn(
+      `落点 ${root} 里已经有扁平会话目录（${flat}），但 layout=layered：` +
+        '官方后端会把它判成非法的 flat-file 布局并拒绝服务。改回 layout: flat，或先把会话搬走。',
+    )
   }
 
   /**
@@ -369,6 +549,47 @@ export class ProjectScopedSessionPersistence extends SessionPersistence {
       // 诊断失败不是失败
     }
   }
+}
+
+/**
+ * 读一个配置项：volatile 字段是 `{ get() }` 引用，普通字段就是值本身。
+ *
+ * @param value - Config 上的字段。
+ * @param fallback - 两者都取不到时的兜底值。
+ * @returns 有效值。
+ */
+function readConfigValue(value, fallback) {
+  const raw = value !== null && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value
+  return raw ?? fallback
+}
+
+/**
+ * 在某个落点里找一个「里面直接放着产物文件」的子目录 —— 也就是扁平会话目录。
+ *
+ * 只用于 `layered` 的告警：官方后端看到这种形状会拒绝服务。
+ *
+ * @param root - 绝对落点。
+ * @returns 该子目录的绝对路径；没有时 `undefined`。
+ */
+function findFlatSessionDir(root) {
+  let entries
+  try {
+    entries = readdirSync(root, { withFileTypes: true })
+  } catch {
+    return undefined
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const dir = resolve(root, entry.name)
+    let children
+    try {
+      children = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    if (children.some((child) => child.isFile() && /^session\.v\d+\.jsonl(\.zstd)?$/.test(child.name))) return dir
+  }
+  return undefined
 }
 
 export default ProjectScopedSessionPersistence
